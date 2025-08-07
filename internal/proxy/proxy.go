@@ -16,10 +16,18 @@ type Proxy struct {
 	BackendAddr string
 }
 
+// Pooling a buffer
+var bufPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 32*1024)
+	},
+}
+
 func readAndWrite(ctx context.Context, connToRead net.Conn, connToWrite net.Conn, cancelConn context.CancelFunc, wg *sync.WaitGroup) {
 	defer wg.Done()
 	// Create buffer for data transfer (32KB)
-	buf := make([]byte, 1024*32)
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(&buf)
 
 	// Start goroutine to close connections when context is cancelled
 	wg.Add(1)
@@ -57,7 +65,7 @@ func readAndWrite(ctx context.Context, connToRead net.Conn, connToWrite net.Conn
 			if writeErr != nil {
 				log.Printf("write to %v error: %v", connToWrite.RemoteAddr(), writeErr)
 				// Shutdown read side of the connection if it has problems with its write side
-				if tcpConn, ok := connToRead.(*net.TCPConn); ok {
+				if tcpConn, ok := connToWrite.(*net.TCPConn); ok {
 					tcpConn.CloseRead() //nolint:errcheck
 				}
 				// Signal connection termination and exit
