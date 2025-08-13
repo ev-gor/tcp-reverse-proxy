@@ -3,7 +3,6 @@ package main
 import (
 	// Standard library imports
 	"context"   // For context management and cancellation
-	"flag"      // For command-line flag parsing
 	"log"       // For logging messages
 	"os"        // For OS functionality like signals
 	"os/signal" // For signal handling
@@ -15,12 +14,6 @@ import (
 )
 
 func main() {
-	// Define command-line flags with default values
-	listenAddr := flag.String("listen", "localhost:8080", "Proxy listen address")
-	backendAddr := flag.String("backend", "localhost:9000", "Backend server address")
-
-	// Parse the command-line flags
-	flag.Parse()
 	// Create wait group to track all goroutines
 	var wg sync.WaitGroup
 
@@ -28,11 +21,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop() // Ensure context cancellation function is called
 	// Initialize the proxy server with configured addresses
-	proxyServer := &proxy.Proxy{
-		ListenAddr:  *listenAddr,
-		BackendAddr: *backendAddr,
+	proxyServer, proxyError := proxy.CreateProxy()
+	if proxyError != nil {
+		//nolint:gocritic
+		log.Fatalf("Failed to create proxy server: %v", proxyError)
 	}
-
 	// Add to wait group before starting the goroutine
 	wg.Add(1)
 

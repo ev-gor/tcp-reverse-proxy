@@ -2,12 +2,164 @@ package proxy
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestCreateProxy(t *testing.T) {
+	tests := []struct {
+		name    string
+		options []Option
+		wantErr bool
+	}{
+		{
+			name:    "default configuration",
+			options: nil,
+			wantErr: false,
+		},
+		{
+			name: "with valid options",
+			options: []Option{
+				WithListenAddr(":8080"),
+				WithBackendAddr("localhost:9090"),
+				WithBufferSize(2),
+			},
+			wantErr: false,
+		},
+		{
+			name: "with invalid option",
+			options: []Option{
+				func(cfg *config) error {
+					return errors.New("invalid option")
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proxy, err := CreateProxy(tt.options...)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CreateProxy() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && proxy == nil {
+				t.Error("CreateProxy() returned nil proxy without error")
+			}
+		})
+	}
+}
+
+func TestProxy_Run_ListenError_PortInUse(t *testing.T) {
+	// First, create a listener to occupy a port
+	tempListener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Failed to create temp listener: %v", err)
+	}
+	defer tempListener.Close()
+
+	// Get the address that's now in use
+	addr := tempListener.Addr().String()
+
+	// Try to create a proxy on the same address
+	proxy, err := CreateProxy(WithListenAddr(addr))
+	if err != nil {
+		t.Fatalf("CreateProxy() failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	err = proxy.Run(ctx, &wg)
+	if err == nil {
+		t.Error("Run() should return listen error for address already in use")
+	}
+
+	// Verify the error is a listen error
+	if err != nil && !contains(err.Error(), "listen error") {
+		t.Errorf("Expected listen error, got: %v", err)
+	}
+
+	// Wait for goroutine to complete
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Good, WaitGroup completed
+	case <-time.After(1 * time.Second):
+		t.Error("WaitGroup did not complete in time")
+	}
+}
+
+func TestProxy_Run_GracefulShutdown(t *testing.T) {
+	// Create a proxy with a valid address
+	proxy, err := CreateProxy(WithListenAddr(":0")) // Use port 0 for auto-assignment
+	if err != nil {
+		t.Fatalf("CreateProxy() failed: %v", err)
+	}
+
+	// Start the proxy in a goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	var runErr error
+
+	wg.Add(1)
+	go func() {
+		runErr = proxy.Run(ctx, &wg)
+	}()
+
+	// Give the proxy time to start listening
+	time.Sleep(10 * time.Millisecond)
+
+	// Cancel the context to trigger shutdown
+	cancel()
+
+	// Wait for completion with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Verify that Run() returned without error (graceful shutdown)
+		if runErr != nil {
+			t.Errorf("Run() should return nil on graceful shutdown, got: %v", runErr)
+		}
+	case <-time.After(1 * time.Second):
+		t.Error("Run() did not complete gracefully within timeout")
+	}
+}
+
+func TestProxy_Run_BufferPoolInitialization(t *testing.T) {
+	bufferSize := 4
+	proxy, err := CreateProxy(WithBufferSize(bufferSize))
+	if err != nil {
+		t.Fatalf("CreateProxy() failed: %v", err)
+	}
+
+	// Test that buffer pool is properly initialized
+	buf := proxy.bufPool.Get().([]byte)
+	expectedSize := 1024 * bufferSize
+	if len(buf) != expectedSize {
+		t.Errorf("Buffer pool buffer size = %d, expected %d", len(buf), expectedSize)
+	}
+	proxy.bufPool.Put(&buf)
+}
 
 // TestProxy_Run tests the basic functionality of the proxy
 func TestProxy_Run(t *testing.T) {
@@ -45,11 +197,10 @@ func TestProxy_Run(t *testing.T) {
 	}()
 
 	// Create and start proxy
-	proxy := &Proxy{
-		ListenAddr:  "127.0.0.1:8080",
-		BackendAddr: backendListener.Addr().String(),
+	proxy, proxyErr := CreateProxy()
+	if proxyErr != nil {
+		t.Fatalf("CreateProxy() failed: %v", proxyErr)
 	}
-
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -65,7 +216,7 @@ func TestProxy_Run(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Connect to proxy
-	conn, err := net.Dial("tcp", proxy.ListenAddr)
+	conn, err := net.Dial("tcp", proxy.config.listenAddr)
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -104,11 +255,10 @@ func TestProxy_Run(t *testing.T) {
 
 // TestProxy_ConnectionRefused tests proxy behavior when backend is unavailable
 func TestProxy_ConnectionRefused(t *testing.T) {
-	proxy := &Proxy{
-		ListenAddr:  "127.0.0.1:8080",
-		BackendAddr: "127.0.0.1:44444", // Using an unlikely to be used port
+	proxy, proxyErr := CreateProxy(WithBackendAddr("127.0.0.1:44444"))
+	if proxyErr != nil {
+		t.Fatalf("CreateProxy() failed: %v", proxyErr)
 	}
-
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -124,7 +274,7 @@ func TestProxy_ConnectionRefused(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Try to connect and send data
-	conn, err := net.Dial("tcp", proxy.ListenAddr)
+	conn, err := net.Dial("tcp", proxy.config.listenAddr)
 	if err != nil {
 		t.Fatalf("Failed to connect to proxy: %v", err)
 	}
@@ -144,40 +294,78 @@ func TestProxy_ConnectionRefused(t *testing.T) {
 	}
 }
 
-// TestProxy_Shutdown tests graceful shutdown of the proxy
-func TestProxy_Shutdown(t *testing.T) {
-	proxy := &Proxy{
-		ListenAddr:  "127.0.0.1:8080",
-		BackendAddr: "127.0.0.1:44444",
+func TestProxy_AcceptError(t *testing.T) {
+	fmt.Println("TestProxy_AcceptError")
+	mockListener := newMockListener(true)
+	proxy, err := CreateProxy()
+	if err != nil {
+		t.Fatalf("CreateProxy() failed: %v", err)
+	}
+	proxy.listenerFactory = func(config config) (net.Listener, error) {
+		return mockListener, nil
 	}
 
 	var wg sync.WaitGroup
 	ctx, cancel := context.WithCancel(t.Context())
-
+	defer cancel()
 	wg.Add(1)
 	go func() {
 		if err := proxy.Run(ctx, &wg); err != nil {
-			t.Errorf("Proxy run error: %v", err)
+			if err.Error() != "mock accept error" {
+				t.Errorf("Expected accept error, got: %v", err)
+			}
 		}
 	}()
-
-	// Wait for proxy to start
 	time.Sleep(100 * time.Millisecond)
-
-	// Cancel context to initiate shutdown
 	cancel()
+	wg.Wait()
+}
 
-	// Wait for shutdown with timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
+type mockListener struct {
+	conns   chan net.Conn
+	close   chan struct{}
+	isError bool
+}
 
-	select {
-	case <-done:
-		// Shutdown completed successfully
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for proxy shutdown")
+func newMockListener(isError bool) *mockListener {
+	return &mockListener{
+		conns:   make(chan net.Conn, 1),
+		close:   make(chan struct{}),
+		isError: isError,
 	}
+}
+
+func (m *mockListener) Accept() (net.Conn, error) {
+	if m.isError {
+		m.isError = false
+		return nil, errors.New("mock accept error")
+	}
+	select {
+	case c := <-m.conns:
+		return c, nil
+	case <-m.close:
+		return nil, net.ErrClosed
+	}
+}
+
+func (m *mockListener) Close() error {
+	close(m.close)
+	return nil
+}
+
+func (*mockListener) Addr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+}
+
+// Helper function to check if a string contains a substring
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > len(substr) && func() bool {
+			for i := 0; i <= len(s)-len(substr); i++ {
+				if s[i:i+len(substr)] == substr {
+					return true
+				}
+			}
+			return false
+		}()))
 }

@@ -4,124 +4,57 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
-	"time"
 )
 
 type Proxy struct {
-	ListenAddr  string
-	BackendAddr string
+	config          config
+	bufPool         sync.Pool
+	listenerFactory ListenerFactory
 }
 
-// Pooling a buffer
-var bufPool = sync.Pool{
-	New: func() any {
-		return make([]byte, 32*1024)
-	},
-}
+func CreateProxy(options ...Option) (*Proxy, error) {
+	cfg := config{
+		listenAddr:  listenAddrDefault,
+		backendAddr: backendAddrDefault,
+		bufferSize:  bufferSizeDefault,
+		tlsEnabled:  tlsEnabledDefault,
+	}
 
-func readAndWrite(ctx context.Context, connToRead net.Conn, connToWrite net.Conn, cancelConn context.CancelFunc, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// Create buffer for data transfer (32KB)
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(&buf)
-
-	// Start goroutine to close connections when context is cancelled
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-ctx.Done()
-		connToRead.Close()
-		connToWrite.Close()
-	}()
-	for {
-		// Read data from source connection
-		n, err := connToRead.Read(buf)
-		if err != nil {
-			// Handle normal connection closure
-			if err == io.EOF {
-				log.Printf("%v closed connection.", connToRead.RemoteAddr())
-
-				// Ignore already closed connection errors
-			} else if !errors.Is(err, net.ErrClosed) {
-				log.Printf("Error reading %v: %v", connToRead.RemoteAddr(), err)
-			}
-			// Gracefully shutdown write side of a TCP connection if the connection has problems with its read side
-			if tcpConn, ok := connToRead.(*net.TCPConn); ok {
-				tcpConn.CloseWrite() //nolint:errcheck
-			}
-			// Signal connection termination and exit
-			cancelConn()
-			return
-		}
-		// Track how many bytes have been written
-		written := 0
-		// Ensure all read bytes are fully written (handle partial writes)
-		for written < n {
-			newWritten, writeErr := connToWrite.Write(buf[written:n])
-			if writeErr != nil {
-				log.Printf("write to %v error: %v", connToWrite.RemoteAddr(), writeErr)
-				// Shutdown read side of the connection if it has problems with its write side
-				if tcpConn, ok := connToWrite.(*net.TCPConn); ok {
-					tcpConn.CloseRead() //nolint:errcheck
-				}
-				// Signal connection termination and exit
-				cancelConn()
-				return
-			}
-			// Update count of bytes written
-			written += newWritten
+	for _, opt := range options {
+		if err := opt(&cfg); err != nil {
+			return nil, fmt.Errorf("apply option: %w", err)
 		}
 	}
-}
 
-func handle(parentCtx context.Context, client net.Conn, backendAddr string, wg *sync.WaitGroup) {
-	defer wg.Done()
-	// Create a cancellable context for this connection
-	connCtx, cancelConn := context.WithCancel(parentCtx)
-	defer cancelConn()
-	defer client.Close()
-
-	// Configure connection timeout
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-
-	// Connect to the backend server
-	backend, err := dialer.DialContext(connCtx, "tcp", backendAddr)
-	if err != nil {
-		log.Printf("Error connecting to backend: %s\n", err)
-		return
+	factory := tcpListenerFactory
+	if cfg.tlsEnabled {
+		factory = tlsListenerFactory
 	}
-	defer backend.Close()
 
-	// Start bidirectional data transfer
-	wg.Add(2)
-	// Forward client -> backend
-	go readAndWrite(connCtx, client, backend, cancelConn, wg)
-	// Forward backend -> client
-	go readAndWrite(connCtx, backend, client, cancelConn, wg)
-
-	// Wait for connection to be cancelled
-	<-connCtx.Done()
+	return &Proxy{
+		config:          cfg,
+		bufPool:         sync.Pool{New: func() any { return make([]byte, 1024*cfg.bufferSize) }},
+		listenerFactory: factory,
+	}, nil
 }
 
 func (p *Proxy) Run(ctx context.Context, wg *sync.WaitGroup) error {
 	defer wg.Done()
-
-	// Start TCP listener on the configured address
-	listener, err := net.Listen("tcp", p.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("listen error: %w", err)
+	listener, listenerErr := p.listenerFactory(p.config)
+	if listenerErr != nil {
+		return fmt.Errorf("create listener: %w", listenerErr)
 	}
-	fmt.Printf("Listening on :%v\n", p.ListenAddr)
+	fmt.Printf("Listening on :%v\n", p.config.listenAddr)
 
 	// Setup goroutine to close listener when context is cancelled
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-ctx.Done()
+		//nolint:errcheck
 		listener.Close()
 	}()
 
@@ -141,6 +74,6 @@ func (p *Proxy) Run(ctx context.Context, wg *sync.WaitGroup) error {
 
 		// Handle each connection in a separate goroutine
 		wg.Add(1)
-		go handle(ctx, conn, p.BackendAddr, wg)
+		go handle(ctx, conn, p.config.backendAddr, wg, &p.bufPool)
 	}
 }
